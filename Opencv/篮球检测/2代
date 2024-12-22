@@ -1,0 +1,414 @@
+/*
+阴影处理
+白平衡均衡
+*/
+
+#include <opencv2/opencv.hpp>
+#include <vector>
+
+using namespace cv;
+using namespace std;
+
+
+// 全局参数
+struct Params {
+    // HSV阈值 - 扩大范围以提高识别率
+    int lower_h = 0;    
+    int upper_h = 25;   // 扩大到25，覆盖更多橙色
+    int lower_s = 43;   // 提高饱和度下限，减少阴影影响
+    int upper_s = 255;
+    int lower_v = 10;   // 大幅降低明度下限，适应阴影区域
+    int upper_v = 255;  // 保持较高的明度上限
+    
+    // 预处理参数
+    int blur_size = 5;
+    int clahe_clip = 3;
+    int clahe_grid = 8;
+    
+    // Canny参数 - 适当放宽
+    int canny_low = 40;   // 降低下限，捕获更多边缘
+    int canny_high = 150;
+    
+    // 霍夫圆检测参数 - 调整以提高识别率
+    int hough_dp = 1;
+    int hough_minDist = 100;
+    int hough_param1 = 50;
+    int hough_param2 = 25;   // 降低阈值，提高检测灵敏度
+    int hough_minRadius =30 ;
+    int hough_maxRadius = 200;
+    
+    // 轮廓筛选参数 - 适当放宽
+    double min_circularity = 0.65;  // 降低圆度要求
+    double min_area = 900;          // 略微降低最小面积
+    double max_area = 120000;       // 略微提高最大面积
+} params;
+
+class BasketballDetector {
+private:
+    Mat frame, hsv, mask, edges;
+    vector<vector<Point>> contours;
+    vector<Vec4i> hierarchy;
+    
+    // 创建双区间HSV掩码
+    Mat createDoubleMask(const Mat& hsv) {
+        Mat mask1, mask2, combined_mask;
+        
+        // 第一个区间 (0-15)
+        inRange(hsv, 
+                Scalar(0, params.lower_s, params.lower_v),
+                Scalar(params.upper_h, params.upper_s, params.upper_v),
+                mask1);
+                
+        // 第二个区间 (170-180)
+        inRange(hsv,
+                Scalar(170, params.lower_s, params.lower_v),
+                Scalar(180, params.upper_s, params.upper_v),
+                mask2);
+                
+        // 合并两个掩码
+        bitwise_or(mask1, mask2, combined_mask);
+        return combined_mask;
+    }
+    
+    // 图像预处理
+    void preprocess() {
+        // 确保 blur_size 为正奇数
+        int blur = params.blur_size;
+        if (blur % 2 == 0) blur++;
+        if (blur < 1) blur = 1;
+        
+        // 高斯模糊
+        GaussianBlur(frame, frame, Size(blur, blur), 0);
+        
+        // CLAHE增强
+        cvtColor(frame, hsv, COLOR_BGR2HSV);
+        vector<Mat> channels;
+        split(hsv, channels);
+        Ptr<CLAHE> clahe = createCLAHE(params.clahe_clip, Size(params.clahe_grid, params.clahe_grid));
+        clahe->apply(channels[2], channels[2]);
+        merge(channels, hsv);
+        
+        // 增强CLAHE处理
+        Mat lab;
+        cvtColor(frame, lab, COLOR_BGR2Lab);
+        vector<Mat> lab_planes;
+        split(lab, lab_planes);
+        
+        Mat dst;
+        clahe->apply(lab_planes[0], dst);
+        dst.copyTo(lab_planes[0]);
+        merge(lab_planes, lab);
+        
+        cvtColor(lab, frame, COLOR_Lab2BGR);
+        
+        // 创建掩码
+        mask = createDoubleMask(hsv);
+        
+        // 形态学操作
+        Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+        morphologyEx(mask, mask, MORPH_OPEN, kernel);
+        morphologyEx(mask, mask, MORPH_CLOSE, kernel);
+        
+        // Canny边缘检测
+        Canny(mask, edges, params.canny_low, params.canny_high);
+    }
+    
+    // 检测圆形
+    vector<Vec3f> detectCircles() {
+        vector<Vec3f> circles;
+        // 确保参数为正数
+        int param1 = max(1, params.hough_param1);
+        int param2 = max(1, params.hough_param2);
+        
+        HoughCircles(edges, circles, HOUGH_GRADIENT,
+                    params.hough_dp,
+                    params.hough_minDist,
+                    param1,  // 使用保护后的参数
+                    param2,  // 使用保护后的参数
+                    params.hough_minRadius,
+                    params.hough_maxRadius);
+        return circles;
+    }
+    
+    // 验证轮廓
+    bool validateContour(const vector<Point>& contour) {
+        double area = contourArea(contour);
+        if (area < params.min_area || area > params.max_area)
+            return false;
+            
+        // 计算圆度
+        double perimeter = arcLength(contour, true);
+        double circularity = 4 * CV_PI * area / (perimeter * perimeter);
+        
+        return circularity > params.min_circularity;
+    }
+    
+    struct CircleInfo {
+        Point2f center;
+        float radius;
+        bool valid;
+        
+        CircleInfo() : valid(false) {}
+        CircleInfo(Point2f c, float r) : center(c), radius(r), valid(true) {}
+    };
+    
+    // 保存最近几帧的检测结果
+    static const int HISTORY_SIZE = 5;
+    vector<CircleInfo> history;
+    
+    // 参数
+    const float MAX_RADIUS_CHANGE_RATIO = 0.3;    // 允许的最大半径变化比例
+    const float MAX_CENTER_DIST = 50.0;           // 允许的最大中心点移动距离
+    
+    // 检查新检测到的圆是否合理
+    bool isValidNewCircle(const Vec3f& circle) {
+        Point2f newCenter(circle[0], circle[1]);
+        float newRadius = circle[2];
+        
+        // 如果历史记录为空，接受第一个检测结果
+        if (history.empty() || !history.back().valid) {
+            return true;
+        }
+        
+        // 获取最近的有效检测结果
+        const CircleInfo& lastValid = history.back();
+        
+        // 检查半径变化
+        float radiusChange = abs(newRadius - lastValid.radius) / lastValid.radius;
+        if (radiusChange > MAX_RADIUS_CHANGE_RATIO) {
+            return false;
+        }
+        
+        // 检查中心点移动距离
+        float centerDist = norm(newCenter - lastValid.center);
+        if (centerDist > MAX_CENTER_DIST) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    // 更新历史记录
+    void updateHistory(const CircleInfo& newCircle) {
+        if (history.size() >= HISTORY_SIZE) {
+            history.erase(history.begin());
+        }
+        history.push_back(newCircle);
+    }
+
+public:
+    struct DetectionResult {
+        Point2f center;
+        float radius;
+        vector<Point> contour;
+        bool valid;
+    };
+    
+    DetectionResult detect(const Mat& input) {
+        frame = input.clone();
+        DetectionResult result;
+        result.valid = false;
+        
+        // 预处理
+        preprocess();
+        
+        // 找到轮廓
+        findContours(mask.clone(), contours, hierarchy, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+        
+        // 霍夫圆检测
+        vector<Vec3f> circles = detectCircles();
+        
+        // 找到最佳的圆
+        CircleInfo bestCircle;
+        float bestScore = 0;
+        
+        for (const auto& circle : circles) {
+            // 基本的圆检验（面积、圆度等）
+            if (!isBasicCircleValid(circle)) {
+                continue;
+            }
+            
+            // 检查时间连续性
+            if (!isValidNewCircle(circle)) {
+                continue;
+            }
+            
+            // 计算当前圆的得分（可以基于圆度、对比度等）
+            float score = calculateCircleScore(input, circle);
+            
+            if (score > bestScore) {
+                bestScore = score;
+                bestCircle = CircleInfo(Point2f(circle[0], circle[1]), circle[2]);
+            }
+        }
+        
+        // 更新历史记录
+        updateHistory(bestCircle);
+        
+        // 结合轮廓和圆检测结果
+        for (const auto& contour : contours) {
+            if (!validateContour(contour))
+                continue;
+                    
+            // 检查圆心是否在轮廓内
+            if (pointPolygonTest(contour, bestCircle.center, false) > 0) {
+                result.center = bestCircle.center;
+                result.radius = bestCircle.radius;
+                result.contour = contour;
+                result.valid = true;
+                return result;
+            }
+        }
+        
+        return result;
+    }
+    
+    // 绘制结果
+    void drawResult(Mat& frame, const DetectionResult& result) {
+        if (!result.valid)
+            return;
+            
+        // 绘制轮廓
+        drawContours(frame, vector<vector<Point>>{result.contour}, 0, Scalar(0, 255, 0), 2);
+        
+        // 绘制圆形
+        circle(frame, result.center, result.radius, Scalar(0, 0, 255), 2);
+        circle(frame, result.center, 3, Scalar(0, 0, 255), -1);
+        
+        // 添加文本信息
+        putText(frame, 
+                format("Radius: %.1f", result.radius),
+                Point(10, 30), FONT_HERSHEY_SIMPLEX, 1,
+                Scalar(0, 255, 0), 2);
+    }
+    
+    // 获取调试图像
+    void getDebugImages(Mat& mask_out, Mat& edges_out) {
+        mask_out = mask.clone();
+        edges_out = edges.clone();
+    }
+    
+    // 计算圆的得分
+    float calculateCircleScore(const Mat& frame, const Vec3f& circle) {
+        // 这里可以添加更复杂的评分机制
+        // 例如：检查圆周边缘的梯度强度、颜色一致性等
+        return 1.0;  // 简单示例
+    }
+    
+    // 基本的圆有效性检查
+    bool isBasicCircleValid(const Vec3f& circle) {
+        float radius = circle[2];
+        double area = M_PI * radius * radius;
+        
+        return (area >= params.min_area && 
+                area <= params.max_area);
+    }
+};
+
+int main() {
+    // 添加命令行参数处理
+    String image_path = "/home/wys/Desktop/Project/VisionProject/Opencv/images/origin/11.png"; // 图片路径
+    cout << "请输入图片路径（直接回车使用摄像头）: ";
+    getline(cin, image_path);
+
+    Mat frame;
+    VideoCapture cap;
+    BasketballDetector detector;
+    bool use_camera = image_path.empty();
+
+    if (use_camera) {
+        cap.open("/home/wys/Desktop/Project/VisionProject/Opencv/images/BasketBall.mp4");
+        // cap.open(2);
+        if (!cap.isOpened())
+            return -1;
+    } else {
+        frame = imread(image_path);
+        if (frame.empty()) {
+            cout << "Error: Could not read the image." << endl;
+            return -1;
+        }
+    }
+
+    namedWindow("Controls", WINDOW_NORMAL);
+    
+    // 创建控制滑块
+    createTrackbar("Lower H", "Controls", &params.lower_h, 180);
+    createTrackbar("Lower S", "Controls", &params.lower_s, 255);
+    createTrackbar("Lower V", "Controls", &params.lower_v, 255);
+    createTrackbar("Upper H", "Controls", &params.upper_h, 180);
+    createTrackbar("Upper S", "Controls", &params.upper_s, 255);
+    createTrackbar("Upper V", "Controls", &params.upper_v, 255);
+    
+    // 图像预处理参数
+    createTrackbar("Blur Size", "Controls", &params.blur_size, 21, nullptr);
+    createTrackbar("CLAHE Clip", "Controls", &params.clahe_clip, 10);
+    createTrackbar("CLAHE Grid", "Controls", &params.clahe_grid, 16);
+    
+    // Canny边缘检测参数
+    createTrackbar("Canny Low", "Controls", &params.canny_low, 255);
+    createTrackbar("Canny High", "Controls", &params.canny_high, 255);
+    
+    // 霍夫圆检测参数
+    createTrackbar("Hough DP", "Controls", &params.hough_dp, 5);
+    createTrackbar("Hough MinDist", "Controls", &params.hough_minDist, 200);
+    createTrackbar("Hough Param1", "Controls", &params.hough_param1, 200, nullptr);
+    createTrackbar("Hough Param2", "Controls", &params.hough_param2, 100, nullptr);
+    createTrackbar("Min Radius", "Controls", &params.hough_minRadius, 100);
+    createTrackbar("Max Radius", "Controls", &params.hough_maxRadius, 200);
+    
+    Mat mask_debug, edges_debug;
+    while (true) {
+        Mat display_frame;
+        if (use_camera) {
+            cap >> display_frame;
+            if (display_frame.empty())
+                break;
+        } else {
+            display_frame = frame.clone();
+        }
+            
+        // 检测篮球
+        auto result = detector.detect(display_frame);
+        
+        // 绘制结果
+        detector.drawResult(display_frame, result);
+        
+        // 显示调试图像
+        detector.getDebugImages(mask_debug, edges_debug);
+        
+        imshow("Frame", display_frame);
+        imshow("Mask", mask_debug);
+        imshow("Edges", edges_debug);
+        
+        char key = waitKey(use_camera ? 1 : 30);
+        if (key == 27) {  // ESC键退出
+            if (!use_camera) {
+                // 输出当前阈值参数
+                cout << "\n当前HSV阈值参数：" << endl;
+                cout << "H: " << params.lower_h << " - " << params.upper_h << endl;
+                cout << "S: " << params.lower_s << " - " << params.upper_s << endl;
+                cout << "V: " << params.lower_v << " - " << params.upper_v << endl;
+                
+                cout << "\n预处理参数：" << endl;
+                cout << "Blur Size: " << params.blur_size << endl;
+                cout << "CLAHE Clip: " << params.clahe_clip << endl;
+                cout << "CLAHE Grid: " << params.clahe_grid << endl;
+                
+                cout << "\nCanny参数：" << endl;
+                cout << "Canny Low: " << params.canny_low << endl;
+                cout << "Canny High: " << params.canny_high << endl;
+                
+                cout << "\n霍夫圆检测参数：" << endl;
+                cout << "Hough DP: " << params.hough_dp << endl;
+                cout << "Hough MinDist: " << params.hough_minDist << endl;
+                cout << "Hough Param1: " << params.hough_param1 << endl;
+                cout << "Hough Param2: " << params.hough_param2 << endl;
+                cout << "Min Radius: " << params.hough_minRadius << endl;
+                cout << "Max Radius: " << params.hough_maxRadius << endl;
+            }
+            break;
+        }
+    }
+    
+    return 0;
+}

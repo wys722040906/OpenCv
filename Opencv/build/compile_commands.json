@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/home/wys/Desktop/Project/VisionProject/Opencv/build",
+  "command": "/usr/bin/clang++ -I/home/wys/Desktop/Project/VisionProject/Opencv/include -isystem /opt/opencv-4.10/include/opencv4 -g -std=gnu++17 -o CMakeFiles/test.dir/src/test31.cpp.o -c /home/wys/Desktop/Project/VisionProject/Opencv/src/test31.cpp",
+  "file": "/home/wys/Desktop/Project/VisionProject/Opencv/src/test31.cpp"
+}
+]

@@ -1,0 +1,15 @@
+%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1000., 0., 640., 0., 1000., 360., 0., 0., 1. ]
+focal_lengths:
+   - 800.
+   - 850.
+   - 900.
+image_size:
+   height: 720
+   width: 1280
+a: 1.
